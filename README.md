@@ -141,4 +141,6 @@ MIT
 
 ## Contact
 
-Working on attention mechanism design? Interested in scaling this to production models? Open an issue or reach out directly.
+Working on attention mechanism design? Interested in scaling this to production models? 
+
+- **Email:** fdr-factor@coze.email
