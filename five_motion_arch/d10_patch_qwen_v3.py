@@ -1,0 +1,331 @@
+"""
+D10五动管道架构改造脚本 v3
+修复: transformers 5.13.1+ 的 rope_parameters 兼容性
+用法：python d10_patch_qwen_v3.py
+"""
+
+import os
+os.environ['HF_ENDPOINT'] = 'https://hf-mirror.com'
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+
+# ============ 五动常量 ============
+PHI = (1 + 5**0.5) / 2
+
+_C5_ADJ = torch.tensor([
+    [0,1,0,0,1],[1,0,1,0,0],[0,1,0,1,0],[0,0,1,0,1],[1,0,0,1,0]
+], dtype=torch.float32)
+
+_A5 = torch.eye(5) + math.cos(math.radians(72)) * _C5_ADJ
+
+C5_RPB_SLOPES = [-1.0, 0.0, -0.5, 1.0, 0.0]
+C5_TEMPS = [0.8, 1.0, 1.2, PHI, 1.0]
+PHI_POWERS = {0: 1.0, 1: 1/PHI, 2: 1/PHI**2, 3: PHI, 4: 1/PHI**3}
+ORGAN_CONFIG = [
+    ('silu', -0.5), ('tanh', 0.0), ('linear', 0.0),
+    ('silu', +0.5), ('identity', 0.0)
+]
+
+print("=" * 60)
+print("D10五动管道架构改造 v3")
+print("=" * 60)
+
+# ============ Step 1: 加载模型 ============
+MODEL_NAME = "Qwen/Qwen2.5-1.5B"
+print(f"\n[1/5] 加载模型: {MODEL_NAME}")
+print(f"  镜像源: {os.environ.get('HF_ENDPOINT', 'default')}")
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+config = AutoConfig.from_pretrained(MODEL_NAME)
+config._attn_implementation = "eager"
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_NAME, dtype=torch.float32, device_map="cpu"
+)
+model.eval()
+
+print(f"  参数量: {sum(p.numel() for p in model.parameters())/1e6:.1f}M")
+print(f"  层数: {config.num_hidden_layers}, heads: {config.num_attention_heads}")
+print(f"  hidden: {config.hidden_size}, d_ff: {config.intermediate_size}")
+
+# ============ Step 2: 基线输出 ============
+print("\n[2/5] 生成基线输出...")
+test_input = "The fundamental nature of reality is"
+inputs = tokenizer(test_input, return_tensors="pt")
+with torch.no_grad():
+    baseline_out = model.generate(**inputs, max_new_tokens=50, do_sample=False)
+baseline_text = tokenizer.decode(baseline_out[0], skip_special_tokens=True)
+print(f"  基线: {baseline_text[:120]}")
+
+# ============ Step 3: D10改造 ============
+print("\n[3/5] 执行D10架构改造...")
+
+# --- 改动1: RoPE theta = φ² ---
+# 兼容 transformers 5.x (rope_parameters) 和 4.x (rope_theta)
+if hasattr(config, 'rope_parameters'):
+    old_theta = config.rope_parameters.get('rope_theta', 10000.0)
+    config.rope_parameters = dict(config.rope_parameters)
+    config.rope_parameters['rope_theta'] = PHI ** 2
+    new_theta = PHI ** 2
+elif hasattr(config, 'rope_theta'):
+    old_theta = config.rope_theta
+    config.rope_theta = PHI ** 2
+    new_theta = config.rope_theta
+else:
+    old_theta = 10000.0
+    new_theta = PHI ** 2
+    print("  ⚠ 无法找到RoPE配置，将手动注入")
+print(f"  [1] RoPE: {old_theta} -> {new_theta:.4f}")
+
+# 重建RoPE - 兼容不同transformers版本
+try:
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
+    new_rotary = Qwen2RotaryEmbedding(config=config, device=model.device)
+except Exception as e:
+    print(f"  ⚠ Qwen2RotaryEmbedding重建失败: {e}")
+    print(f"  尝试直接修改现有rotary_emb的inv_freq...")
+    new_rotary = None
+
+# C5 coupling
+num_heads = config.num_attention_heads
+n_g = num_heads // 5
+rem = num_heads % 5
+blocks = [_A5.clone()] * n_g
+if rem > 0:
+    blocks.append(torch.eye(rem, dtype=torch.float32))
+c5_coupling = torch.block_diag(*blocks)
+print(f"  [2] C5耦合: {c5_coupling.shape}")
+
+d_ff = config.intermediate_size
+d_organ = d_ff // 5
+d_model = config.hidden_size
+
+# --- 通用函数 ---
+def rotate_half(x):
+    x1 = x[..., :x.shape[-1]//2]
+    x2 = x[..., x.shape[-1]//2:]
+    return torch.cat((-x2, x1), dim=-1)
+
+def apply_rotary_pos_emb(q, k, cos, sin):
+    cos = cos.unsqueeze(1)
+    sin = sin.unsqueeze(1)
+    return (q*cos + rotate_half(q)*sin, k*cos + rotate_half(k)*sin)
+
+# --- 重写Attention forward ---
+def d10_attention_forward(
+    self, hidden_states, attention_mask=None, position_ids=None,
+    past_key_value=None, output_attentions=False, use_cache=False,
+    cache_position=None, position_embeddings=None, **kwargs
+):
+    bsz, q_len, _ = hidden_states.size()
+    q = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1,2)
+    k = self.k_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1,2)
+    v = self.v_proj(hidden_states).view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1,2)
+
+    # RoPE - 兼容不同transformers版本
+    if position_embeddings is not None:
+        cos, sin = position_embeddings
+    elif hasattr(self, 'rotary_emb') and self.rotary_emb is not None:
+        try:
+            cos, sin = self.rotary_emb(v, position_ids)
+        except TypeError:
+            # transformers 5.x 可能需要不同参数
+            cos, sin = self.rotary_emb(v, position_ids=position_ids)
+    else:
+        # 手动计算 φ²-RoPE
+        dim = self.head_dim
+        inv_freq = 1.0 / (PHI**2 ** (torch.arange(0, dim, 2, device=v.device).float() / dim))
+        seq_len = q_len
+        t = torch.arange(seq_len, device=v.device, dtype=inv_freq.dtype)
+        freqs = torch.outer(t, inv_freq)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        cos = emb.cos()[None, None, :, :]
+        sin = emb.sin()[None, None, :, :]
+    
+    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+    if self.num_key_value_groups > 1:
+        k = k.unsqueeze(2).expand(-1,-1,self.num_key_value_groups,-1,-1).reshape(bsz,self.num_heads,-1,self.head_dim)
+        v = v.unsqueeze(2).expand(-1,-1,self.num_key_value_groups,-1,-1).reshape(bsz,self.num_heads,-1,self.head_dim)
+
+    attn_weights = torch.matmul(q, k.transpose(-2,-1)) / math.sqrt(self.head_dim)
+
+    # C5 head耦合
+    coupling = self.c5_coupling.to(attn_weights.device, attn_weights.dtype)
+    attn_weights = torch.matmul(coupling, attn_weights)
+
+    # C5 RPB + Z₂
+    lidx = self.layer_idx
+    k_phase = lidx % 5
+    g = lidx // 5 % 2
+    slopes = C5_RPB_SLOPES[:]
+    if g == 1:
+        slopes = [-s for s in slopes]
+    slope = slopes[k_phase]
+    if slope != 0.0:
+        seq = attn_weights.shape[-1]
+        pos = torch.arange(seq, device=attn_weights.device, dtype=attn_weights.dtype)
+        dist = (pos[:,None] - pos[None,:]).abs().float()
+        attn_weights = attn_weights + slope * dist / seq
+
+    # C5温度
+    attn_weights = attn_weights / C5_TEMPS[k_phase]
+
+    if attention_mask is not None:
+        attn_weights = attn_weights + attention_mask
+
+    attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
+    out = torch.matmul(attn_weights, v)
+    out = out.transpose(1,2).contiguous().view(bsz, q_len, self.num_heads*self.head_dim)
+    out = self.o_proj(out)
+
+    return (out, attn_weights) if output_attentions else (out,)
+
+# Patch attention
+for i, layer in enumerate(model.model.layers):
+    attn = layer.self_attn
+    attn.layer_idx = i
+    attn.c5_coupling = c5_coupling.clone()
+    if new_rotary is not None:
+        attn.rotary_emb = new_rotary
+    else:
+        # 标记使用手动RoPE
+        attn.rotary_emb = None
+    attn.forward = d10_attention_forward.__get__(attn, type(attn))
+
+print(f"  [3] Attention: C5耦合+RPB+温度+Z₂ ✓")
+
+# --- 五动FFN ---
+for i, layer in enumerate(model.model.layers):
+    mlp = layer.mlp
+    mlp.W_organ = nn.ModuleList([nn.Linear(d_model, d_organ, bias=True) for _ in range(5)])
+    for j, (_, bv) in enumerate(ORGAN_CONFIG):
+        nn.init.constant_(mlp.W_organ[j].bias, bv)
+
+    with torch.no_grad():
+        w = mlp.gate_proj.weight.data
+        b = mlp.gate_proj.bias.data if mlp.gate_proj.bias is not None else None
+        for j in range(5):
+            s, e = j*d_organ, (j+1)*d_organ
+            mlp.W_organ[j].weight.data.copy_(w[s:e,:])
+            if b is not None:
+                mlp.W_organ[j].bias.data.copy_(b[s:e])
+                mlp.W_organ[j].bias.data.fill_(ORGAN_CONFIG[j][1])
+
+    mlp.register_buffer('c5_adj', _C5_ADJ.clone())
+    mlp.W_out = nn.Linear(5*d_organ, d_model, bias=True)
+
+    with torch.no_grad():
+        dw = mlp.down_proj.weight.data
+        mlp.W_out.weight.data.copy_(dw[:,:5*d_organ])
+        if mlp.down_proj.bias is not None:
+            mlp.W_out.bias.data.copy_(mlp.down_proj.bias.data)
+
+    def make_ffn_fwd(mod):
+        def fwd(x):
+            organs = []
+            for j, w in enumerate(mod.W_organ):
+                h = w(x)
+                act = ORGAN_CONFIG[j][0]
+                if act == 'silu': h = F.silu(h)
+                elif act == 'tanh': h = torch.tanh(h)
+                organs.append(h)
+            organs = torch.stack(organs, dim=-1)
+            organs = torch.einsum('ij,bsdj->bsdi', mod.c5_adj.to(organs.device,organs.dtype), organs)
+            return mod.W_out(organs.reshape(*x.shape[:-1], 5*d_organ))
+        return fwd
+    mlp.forward = make_ffn_fwd(mlp)
+
+print(f"  [4] 五动FFN: 5器官+耦合 ✓")
+
+# --- φ-Residual + Z₂ 层级patch ---
+for i, layer in enumerate(model.model.layers):
+    k = i % 5
+    alpha = PHI_POWERS[k] / math.sqrt(i + 2)
+    g = i // 5 % 2
+
+    orig_fwd = layer.forward
+
+    def make_layer_fwd(of, a, lidx):
+        def fwd(hidden_states, attention_mask=None, position_ids=None,
+                past_key_value=None, output_attentions=False, use_cache=False,
+                cache_position=None, position_embeddings=None, **kwargs):
+            residual = hidden_states
+            hidden_states = layer.input_layernorm(hidden_states)
+            attn_out = layer.self_attn(
+                hidden_states, attention_mask=attention_mask,
+                position_ids=position_ids, past_key_value=past_key_value,
+                output_attentions=output_attentions, use_cache=use_cache,
+                cache_position=cache_position, position_embeddings=position_embeddings,
+            )
+            hidden_states = residual + a * attn_out[0]
+
+            residual = hidden_states
+            hidden_states = layer.post_attention_layernorm(hidden_states)
+            hidden_states = layer.mlp(hidden_states)
+            hidden_states = residual + a * hidden_states
+
+            return (hidden_states,)
+        return fwd
+    layer.forward = make_layer_fwd(orig_fwd, alpha, i)
+
+print(f"  [5] φ-Residual: 呼吸节奏 ✓")
+print(f"\n  ✅ D10架构改造完成!")
+print(f"  - φ²-RoPE θ={new_theta:.4f}")
+print(f"  - C5-Attention: 耦合+RPB+温度+Z₂")
+print(f"  - 五动FFN: 5器官+耦合")
+print(f"  - φ-Residual: φ呼吸")
+
+# ============ Step 4: D10推理 ============
+print("\n[4/5] D10改造后推理...")
+with torch.no_grad():
+    d10_out = model.generate(**inputs, max_new_tokens=50, do_sample=False)
+d10_text = tokenizer.decode(d10_out[0], skip_special_tokens=True)
+
+print(f"\n{'='*60}")
+print(f"输入: {test_input}")
+print(f"{'='*60}")
+print(f"基线: {baseline_text[:150]}")
+print(f"{'─'*60}")
+print(f"D10:  {d10_text[:150]}")
+print(f"{'='*60}")
+
+# ============ Step 5: 五动诊断 ============
+print("\n[5/5] 五动层诊断...")
+diag_in = tokenizer("The universe is", return_tensors="pt")
+layer_norms = []
+hooks = []
+
+def nh(name):
+    def fn(mod, inp, out):
+        layer_norms.append((name, out[0].norm().item()))
+    return fn
+
+with torch.no_grad():
+    for i, layer in enumerate(model.model.layers):
+        hooks.append(layer.register_forward_hook(nh(f"L{i}")))
+    _ = model.generate(**diag_in, max_new_tokens=10, do_sample=False)
+    for h in hooks:
+        h.remove()
+
+print("\n  层级激活范数 (五动周期):")
+names = ['认','遇','落','裂','余']
+for i, (nm, v) in enumerate(layer_norms):
+    k = i % 5
+    g = i // 5 % 2
+    z2 = '⇄' if g == 1 else '→'
+    print(f"  {nm} [{names[k]}] {z2} norm={v:.4f}")
+
+print(f"\n{'='*60}")
+print("D10五动管道架构改造完成!")
+print(f"{'='*60}")
+
+save_path = "./qwen2.5-1.5b-d10"
+print(f"\n保存到 {save_path}...")
+model.save_pretrained(save_path)
+tokenizer.save_pretrained(save_path)
+print("✅ 完成!")
