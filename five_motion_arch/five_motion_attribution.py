@@ -249,8 +249,13 @@ def compute_activation_diff(captures_orig, captures_alt, num_layers):
     diffs = []
     for i in range(num_layers):
         if i in captures_orig and i in captures_alt:
-            t_orig = captures_orig[i]
-            t_alt = captures_alt[i]
+            t_orig = captures_orig[i].float()
+            t_alt = captures_alt[i].float()
+            # Ensure 3D: [batch, seq_len, hidden]
+            if t_orig.dim() == 2:
+                t_orig = t_orig.unsqueeze(0)
+            if t_alt.dim() == 2:
+                t_alt = t_alt.unsqueeze(0)
             # Align seq_len: trim to the shorter one
             min_len = min(t_orig.shape[1], t_alt.shape[1])
             diff = (t_orig[:, :min_len, :] - t_alt[:, :min_len, :]).norm().item()
