@@ -249,7 +249,11 @@ def compute_activation_diff(captures_orig, captures_alt, num_layers):
     diffs = []
     for i in range(num_layers):
         if i in captures_orig and i in captures_alt:
-            diff = (captures_orig[i] - captures_alt[i]).norm().item()
+            t_orig = captures_orig[i]
+            t_alt = captures_alt[i]
+            # Align seq_len: trim to the shorter one
+            min_len = min(t_orig.shape[1], t_alt.shape[1])
+            diff = (t_orig[:, :min_len, :] - t_alt[:, :min_len, :]).norm().item()
             diffs.append(diff)
         else:
             diffs.append(0.0)
