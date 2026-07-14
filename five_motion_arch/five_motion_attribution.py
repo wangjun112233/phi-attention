@@ -304,7 +304,9 @@ def forward_last_hidden(model, tokenizer, prompt, num_layers):
     remove_hooks(hooks)
     last_layer_hs = captures.get(num_layers - 1, None)
     if last_layer_hs is not None:
-        # 取最后一个token: shape [1, hidden_size]
+        # Ensure 3D then take last token: shape [1, hidden_size]
+        if last_layer_hs.dim() == 2:
+            last_layer_hs = last_layer_hs.unsqueeze(0)
         last_layer_hs = last_layer_hs[:, -1, :].detach().clone()
     # 释放其余层的capture
     del captures
