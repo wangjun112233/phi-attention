@@ -216,9 +216,27 @@ def make_mlp_scale(alpha):
         return alpha * out
     return hook
 
+def get_transformer_layers(model):
+    """穿透PeftModel/LoRA包装层, 找到实际的transformer layers"""
+    # 可能的路径: model.model.layers (原始)
+    #            model.base_model.model.model.layers (LoRA包装后)
+    candidates = [
+        lambda m: m.model.layers,           # 原始 Qwen2ForCausalLM
+        lambda m: m.base_model.model.model.layers,  # PeftModel包装后
+    ]
+    for fn in candidates:
+        try:
+            layers = fn(model)
+            if layers is not None:
+                return layers
+        except AttributeError:
+            continue
+    raise AttributeError("无法找到transformer layers, 模型结构: " + str(type(model)))
+
 def apply_phi_hooks(model, alphas):
     hooks = []
-    for i, layer in enumerate(model.model.layers):
+    layers = get_transformer_layers(model)
+    for i, layer in enumerate(layers):
         a = alphas[i]
         hooks.append(layer.self_attn.register_forward_hook(make_attn_scale(a)))
         hooks.append(layer.mlp.register_forward_hook(make_mlp_scale(a)))
@@ -304,7 +322,8 @@ def make_layer_capture_hook(captures, layer_idx):
 
 def apply_capture_hooks(model, captures):
     hooks = []
-    for i, layer in enumerate(model.model.layers):
+    layers = get_transformer_layers(model)
+    for i, layer in enumerate(layers):
         hooks.append(layer.register_forward_hook(make_layer_capture_hook(captures, i)))
     return hooks
 
