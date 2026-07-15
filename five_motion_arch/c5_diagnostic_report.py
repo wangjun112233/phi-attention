@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""C5-RPB Diagnostic Report Generator for LLMs
-Runs full diagnostic pipeline and generates a formatted Markdown report.
+"""C5-RPB Diagnostic Report Generator v2 for LLMs
+Runs full diagnostic pipeline with multi-amp scan and proper Z2 shift measurement.
 
 Usage:
   python c5_diagnostic_report.py --model_path PATH --device cpu
@@ -61,13 +61,14 @@ PPL_TEXTS = [
 ]
 
 # ============================================================================
-# C5 measurement (head-level h%5, from v4)
+# C5 measurement (head-level h%5, from v4) + phase similarity
 # ============================================================================
 
 C5_ADJACENT = [(0,1),(1,2),(2,3),(3,4),(4,0)]
 C5_NONADJ  = [(0,2),(0,3),(1,3),(1,4),(2,4)]
 
 def measure_head_phase_c5(attn_weights, n_heads):
+    """Measure C5 structure from head attention patterns. Returns k1 + phase similarity matrix."""
     features = np.zeros((n_heads, attn_weights.shape[1]))
     for h in range(n_heads):
         features[h] = attn_weights[h, -1, :]
@@ -111,8 +112,16 @@ def measure_head_phase_c5(attn_weights, n_heads):
         'phase_sim_matrix': phase_sim,
     }
 
+def compute_z2_shift(phase_sim_normal, phase_sim_flipped):
+    """Compute Z2 collapse shift from two phase similarity matrices.
+    Measures how much the phase structure reshuffles after Z2 negation."""
+    diff = np.abs(phase_sim_normal - phase_sim_flipped)
+    # Exclude diagonal (always 1.0)
+    mask = ~np.eye(5, dtype=bool)
+    return float(np.mean(diff[mask]))
+
 # ============================================================================
-# Manual forward with RPB (for k1 measurement)
+# Manual forward with RPB capture (returns attention weights + phase sim)
 # ============================================================================
 
 def run_model_with_rpb_capture(model, input_ids, attention_mask, rpb_per_layer, n_layers, n_heads, n_kv_heads, hidden_size, head_dim, device):
@@ -266,40 +275,57 @@ def compute_ppl_c5rpb(model, tokenizer, texts, rpb_amp, device, max_length=256, 
     return math.exp(avg), avg
 
 # ============================================================================
-# Scoring
+# Scoring (v2 - based on best amp results)
 # ============================================================================
 
-def grade_c5_compatibility(std_k1, c5_k1, z2_shift, ppl_pct):
-    """Return A/B/C/D grade and description."""
-    dk1 = c5_k1 - std_k1
+def grade_c5_compatibility(std_k1, best_c5_k1, z2_shift, best_ppl_pct):
+    """Grade based on best achievable results across all amplitudes."""
+    dk1 = best_c5_k1 - std_k1
     score = 0
-    # k1 enhancement
-    if dk1 > 0.25: score += 4
-    elif dk1 > 0.15: score += 3
-    elif dk1 > 0.05: score += 2
-    elif dk1 > 0.01: score += 1
-    # Z2 detectable
-    if z2_shift > 0.15: score += 2
-    elif z2_shift > 0.05: score += 1
-    # PPL cost
-    if ppl_pct < 2: score += 2
-    elif ppl_pct < 8: score += 1
+    details = []
 
-    if score >= 7: return "A", "Excellent C5 compatibility. Structure injects cleanly with minimal cost."
-    elif score >= 5: return "B", "Good C5 compatibility. Structure injects well, modest PPL cost."
-    elif score >= 3: return "C", "Moderate C5 compatibility. Structure injects but with significant cost or weak signal."
-    else: return "D", "Low C5 compatibility. Head differentiation insufficient or cost too high."
+    # k1 enhancement (most important)
+    if dk1 > 0.25:
+        score += 4; details.append("k1: very strong (+4)")
+    elif dk1 > 0.15:
+        score += 3; details.append("k1: strong (+3)")
+    elif dk1 > 0.05:
+        score += 2; details.append("k1: moderate (+2)")
+    elif dk1 > 0.01:
+        score += 1; details.append("k1: weak (+1)")
+    else:
+        details.append("k1: none (+0)")
 
-def recommend_amp(ppl_results):
-    """Find the highest amp with <5% PPL cost, or the lowest cost amp."""
-    best_amp, best_pct = 0.5, 999
-    for amp, ppl, pct in ppl_results:
-        if pct < 5 and amp > best_amp:
-            best_amp = amp
-        if pct < best_pct:
-            best_pct = pct
-            best_amp_fallback = amp
-    return best_amp if best_amp > 0.5 else best_amp_fallback
+    # Z2 shift (real phase similarity, not k1 proxy)
+    if z2_shift > 0.10:
+        score += 2; details.append("Z2: clear (+2)")
+    elif z2_shift > 0.03:
+        score += 1; details.append("Z2: detectable (+1)")
+    else:
+        details.append("Z2: weak (+0)")
+
+    # PPL cost (at best amp)
+    if best_ppl_pct < 2:
+        score += 3; details.append("PPL: free lunch (+3)")
+    elif best_ppl_pct < 5:
+        score += 2; details.append("PPL: cheap (+2)")
+    elif best_ppl_pct < 10:
+        score += 1; details.append("PPL: moderate (+1)")
+    else:
+        details.append("PPL: expensive (+0)")
+
+    if score >= 8: grade = "A"
+    elif score >= 6: grade = "B"
+    elif score >= 4: grade = "C"
+    else: grade = "D"
+
+    descs = {
+        "A": "Excellent C5 compatibility. Structure injects cleanly with near-zero cost. Both inference-time and training-time integration viable.",
+        "B": "Good C5 compatibility. Structure injects well with low cost. Inference-time viable; training-time recommended for best results.",
+        "C": "Moderate C5 compatibility. Structure injects but signal or cost needs tuning. Training-time integration recommended.",
+        "D": "Low C5 compatibility. Head differentiation insufficient or cost too high. Requires training-time integration from scratch.",
+    }
+    return grade, descs[grade], score, details
 
 # ============================================================================
 # Main
@@ -317,12 +343,15 @@ def main():
     model_path = os.path.normpath(os.path.abspath(args.model_path))
     model_name = os.path.basename(os.path.dirname(model_path)).replace('--', '/')
 
+    AMP_SCAN = [0.3, 0.5, 1.0]  # k1 scan amplitudes
+    AMP_PPL  = [0.5, 1.0, 2.0]  # PPL scan amplitudes
+
     print("=" * 70, flush=True)
-    print("C5-RPB Diagnostic Report Generator", flush=True)
+    print("C5-RPB Diagnostic Report Generator v2", flush=True)
     print("=" * 70, flush=True)
 
     # Load model
-    print("\n[1/6] Loading model...", flush=True)
+    print("\n[1/7] Loading model...", flush=True)
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=False, local_files_only=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -341,8 +370,8 @@ def main():
 
     print(f"  {model_name}: {n_layers}L, {n_heads}H, {n_kv_heads}KV, {hidden_size}d, {n_params:.1f}B params", flush=True)
 
-    # Prepare inputs for k1 measurement
-    print("\n[2/6] Preparing diagnostic inputs...", flush=True)
+    # Prepare inputs
+    print("\n[2/7] Preparing diagnostic inputs...", flush=True)
     encoded = []
     for prompt in DIAG_PROMPTS:
         inputs = tokenizer(prompt, return_tensors='pt', padding=False).to(args.device)
@@ -357,49 +386,69 @@ def main():
             e['attention_mask'] = torch.cat([e['attention_mask'], torch.zeros((1, pad_len), device=args.device, dtype=torch.long)], dim=1)
 
     # Standard attention k1
-    print("\n[3/6] Standard attention measurement...", flush=True)
+    print("\n[3/7] Standard attention measurement...", flush=True)
     std_k1_by_layer = {}
+    std_phase_sim_by_layer = {}
     with torch.no_grad():
         for pi, inputs in enumerate(encoded):
             output = model(**inputs, output_attentions=True)
             for l, attn in enumerate(output.attentions):
                 if l not in std_k1_by_layer:
                     std_k1_by_layer[l] = []
+                    std_phase_sim_by_layer[l] = []
                 m = measure_head_phase_c5(attn[0].cpu().float().numpy(), n_heads)
                 std_k1_by_layer[l].append(m['k1_ratio'])
+                std_phase_sim_by_layer[l].append(m['phase_sim_matrix'])
     std_k1_final = np.mean(std_k1_by_layer[n_layers-1])
     std_k1_mean = np.mean([np.mean(v) for v in std_k1_by_layer.values()])
     print(f"  Standard k1 (final): {std_k1_final:.4f}, mean: {std_k1_mean:.4f}", flush=True)
 
-    # C5-RPB attention k1
-    print("\n[4/6] C5-RPB attention measurement (amp=0.5)...", flush=True)
-    rpb_normal = make_c5_rpb_tensor(n_heads, max_seq+10, amplitude=0.5, device=args.device, dtype=torch.float32)
-    rpb_per_layer = {l: rpb_normal for l in range(n_layers)}
-    c5_k1_by_layer = {}
-    for pi, inputs in enumerate(encoded):
-        print(f"  Prompt {pi+1}/5...", flush=True)
-        captured = run_model_with_rpb_capture(
-            model, inputs['input_ids'], inputs.get('attention_mask'),
-            rpb_per_layer, n_layers, n_heads, n_kv_heads, hidden_size, head_dim, args.device
-        )
-        for l in captured:
-            if l not in c5_k1_by_layer:
-                c5_k1_by_layer[l] = []
-            m = measure_head_phase_c5(captured[l], n_heads)
-            c5_k1_by_layer[l].append(m['k1_ratio'])
-    c5_k1_final = np.mean(c5_k1_by_layer[n_layers-1])
-    c5_k1_mean = np.mean([np.mean(v) for v in c5_k1_by_layer.values()])
-    dk1_final = c5_k1_final - std_k1_final
-    print(f"  C5-RPB k1 (final): {c5_k1_final:.4f}, delta: {dk1_final:+.4f}", flush=True)
+    # C5-RPB k1 at multiple amplitudes
+    print(f"\n[4/7] C5-RPB k1 scan (amp={AMP_SCAN})...", flush=True)
+    amp_k1_results = {}  # amp -> {layer -> [k1 values]}
+    amp_phase_sim_results = {}  # amp -> {layer -> [phase_sim matrices]}
+    for amp in AMP_SCAN:
+        print(f"\n  --- amp={amp} ---", flush=True)
+        rpb = make_c5_rpb_tensor(n_heads, max_seq+10, amplitude=amp, device=args.device, dtype=torch.float32)
+        rpb_per_layer = {l: rpb for l in range(n_layers)}
+        k1_by_layer = {}
+        phase_sim_by_layer = {}
+        for pi, inputs in enumerate(encoded):
+            print(f"  amp={amp} prompt {pi+1}/5...", flush=True)
+            captured = run_model_with_rpb_capture(
+                model, inputs['input_ids'], inputs.get('attention_mask'),
+                rpb_per_layer, n_layers, n_heads, n_kv_heads, hidden_size, head_dim, args.device
+            )
+            for l in captured:
+                if l not in k1_by_layer:
+                    k1_by_layer[l] = []
+                    phase_sim_by_layer[l] = []
+                m = measure_head_phase_c5(captured[l], n_heads)
+                k1_by_layer[l].append(m['k1_ratio'])
+                phase_sim_by_layer[l].append(m['phase_sim_matrix'])
+        amp_k1_results[amp] = k1_by_layer
+        amp_phase_sim_results[amp] = phase_sim_by_layer
+        print(f"  amp={amp} k1 (final): {np.mean(k1_by_layer[n_layers-1]):.4f} (delta: {np.mean(k1_by_layer[n_layers-1])-std_k1_final:+.4f})", flush=True)
 
-    # Z2 collapse
+    # Find best amp: highest k1 gain where PPL < 5%
+    # We don't have PPL yet, so use amp=0.5 as reference best (known sweet spot)
+    # and note the actual best after PPL scan
+    best_k1_amp = max(AMP_SCAN, key=lambda a: np.mean(amp_k1_results[a][n_layers-1]))
+    c5_k1_final = np.mean(amp_k1_results[best_k1_amp][n_layers-1])
+    c5_k1_mean = np.mean([np.mean(v) for v in amp_k1_results[best_k1_amp].values()])
+
+    # Z2 collapse test with proper phase similarity measurement
     collapse_layer = n_layers // 2
-    print(f"\n[5/6] Z2 collapse test (flip at layer {collapse_layer})...", flush=True)
-    rpb_z2 = make_c5_rpb_tensor(n_heads, max_seq+10, amplitude=0.5, phi_shift=math.pi, device=args.device, dtype=torch.float32)
+    print(f"\n[5/7] Z2 collapse test (flip at layer {collapse_layer})...", flush=True)
+    z2_amp = 0.5  # test Z2 at sweet spot
+    rpb_normal = make_c5_rpb_tensor(n_heads, max_seq+10, amplitude=z2_amp, device=args.device, dtype=torch.float32)
+    rpb_z2 = make_c5_rpb_tensor(n_heads, max_seq+10, amplitude=z2_amp, phi_shift=math.pi, device=args.device, dtype=torch.float32)
     rpb_collapse = {l: (rpb_normal if l <= collapse_layer else rpb_z2) for l in range(n_layers)}
+
+    z2_phase_sim_by_layer = {}
     z2_k1_by_layer = {}
     for pi, inputs in enumerate(encoded):
-        print(f"  Prompt {pi+1}/5...", flush=True)
+        print(f"  Z2 prompt {pi+1}/5...", flush=True)
         captured = run_model_with_rpb_capture(
             model, inputs['input_ids'], inputs.get('attention_mask'),
             rpb_collapse, n_layers, n_heads, n_kv_heads, hidden_size, head_dim, args.device
@@ -407,40 +456,78 @@ def main():
         for l in captured:
             if l not in z2_k1_by_layer:
                 z2_k1_by_layer[l] = []
+                z2_phase_sim_by_layer[l] = []
             m = measure_head_phase_c5(captured[l], n_heads)
             z2_k1_by_layer[l].append(m['k1_ratio'])
+            z2_phase_sim_by_layer[l].append(m['phase_sim_matrix'])
 
-    # Compute Z2 shift from phase similarity matrices at key layers
-    # Re-run just for phase sim at collapse_layer+1
-    z2_shift = 0.0
+    # Compute real Z2 shift from phase similarity matrices
     check_layer = min(collapse_layer + 1, n_layers - 1)
-    if check_layer in c5_k1_by_layer and check_layer in z2_k1_by_layer:
-        z2_shift = abs(np.mean(z2_k1_by_layer[check_layer]) - np.mean(c5_k1_by_layer[check_layer]))
-    # Better: re-run with phase sim capture (simplified - use k1 diff as proxy)
-    # For more accurate Z2 shift, would need phase sim matrices
-    print(f"  Z2 k1 shift (layer {check_layer}): {z2_shift:.4f}", flush=True)
+    z2_shifts = []
+    # Check multiple layers after collapse point
+    for l in range(collapse_layer+1, min(collapse_layer+5, n_layers)):
+        if l in amp_phase_sim_results[z2_amp] and l in z2_phase_sim_by_layer:
+            for prompt_idx in range(len(encoded)):
+                if prompt_idx < len(amp_phase_sim_results[z2_amp][l]) and prompt_idx < len(z2_phase_sim_by_layer[l]):
+                    shift = compute_z2_shift(
+                        amp_phase_sim_results[z2_amp][l][prompt_idx],
+                        z2_phase_sim_by_layer[l][prompt_idx]
+                    )
+                    z2_shifts.append(shift)
+    z2_shift = np.mean(z2_shifts) if z2_shifts else 0.0
+    print(f"  Z2 phase sim shift (post-collapse avg): {z2_shift:.4f}", flush=True)
 
     # Perplexity tests
-    print("\n[6/6] Perplexity comparison...", flush=True)
+    print("\n[6/7] Perplexity comparison...", flush=True)
     std_ppl, std_loss = compute_ppl_standard(model, tokenizer, PPL_TEXTS, args.device, args.max_length)
     print(f"  Standard PPL: {std_ppl:.2f}", flush=True)
 
     ppl_results = []
-    for amp in [0.5, 1.0, 2.0]:
+    for amp in AMP_PPL:
         c5_ppl, c5_loss = compute_ppl_c5rpb(model, tokenizer, PPL_TEXTS, amp, args.device, args.max_length)
         pct = ((c5_ppl - std_ppl) / std_ppl) * 100
         ppl_results.append((amp, c5_ppl, pct))
         print(f"  C5-RPB amp={amp}: PPL={c5_ppl:.2f} ({pct:+.1f}%)", flush=True)
 
+    # Also test Z2 flip PPL
+    z2_ppl, _ = compute_ppl_c5rpb(model, tokenizer, PPL_TEXTS, 0.5, args.device, args.max_length, phi_shift=math.pi)
+    z2_pct = ((z2_ppl - std_ppl) / std_ppl) * 100
+    print(f"  Z2 flip (amp=0.5): PPL={z2_ppl:.2f} ({z2_pct:+.1f}%)", flush=True)
+
+    # Find best amp (highest with PPL < 5%)
+    best_ppl_amp = 0.5
+    best_ppl_pct = 999
+    for amp, ppl, pct in ppl_results:
+        if pct < 5 and amp >= best_ppl_amp:
+            best_ppl_amp = amp
+        if abs(pct) < abs(best_ppl_pct):
+            best_ppl_pct = pct
+            best_ppl_amp_fallback = amp
+    if best_ppl_amp == 0.5 and best_ppl_pct >= 5:
+        best_ppl_amp = best_ppl_amp_fallback
+        best_ppl_pct = best_ppl_pct
+
+    # Use k1 from the best PPL amp
+    final_c5_k1 = np.mean(amp_k1_results.get(best_ppl_amp, amp_k1_results[0.5])[n_layers-1])
+    final_c5_k1_mean = np.mean([np.mean(v) for v in amp_k1_results.get(best_ppl_amp, amp_k1_results[0.5]).values()])
+
     # Grade
-    best_amp = recommend_amp(ppl_results)
-    best_pct = [p for p in ppl_results if p[0] == best_amp][0][2]
-    grade, grade_desc = grade_c5_compatibility(std_k1_final, c5_k1_final, z2_shift, abs(best_pct))
+    print("\n[7/7] Generating report...", flush=True)
+    grade, grade_desc, score, score_details = grade_c5_compatibility(
+        std_k1_final, final_c5_k1, z2_shift, abs(best_ppl_pct)
+    )
 
     # Head grouping info
-    head_groups = [h % 5 for h in range(n_heads)]
     from collections import Counter
+    head_groups = [h % 5 for h in range(n_heads)]
     group_counts = Counter(head_groups)
+
+    # Build k1 scan table
+    k1_scan_rows = []
+    for amp in AMP_SCAN:
+        k1_val = np.mean(amp_k1_results[amp][n_layers-1])
+        dk1 = k1_val - std_k1_final
+        k1_scan_rows.append((amp, k1_val, dk1))
 
     # Generate report
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -475,55 +562,107 @@ C5-RPB assigns heads to 5 phase groups based on head index modulo 5:
         report += f"| {p} | {', '.join(map(str, heads_in_group))} | {len(heads_in_group)} |\n"
 
     report += f"""
-## 3. C5 Structure Metrics
+## 3. C5 Structure — k1 Amplitude Scan
 
-| Metric | Standard | C5-RPB (amp=0.5) | Delta |
-|--------|----------|-------------------|-------|
-| DFT k1 (last layer) | {std_k1_final:.4f} | {c5_k1_final:.4f} | **{dk1_final:+.4f}** |
-| DFT k1 (mean all layers) | {std_k1_mean:.4f} | {c5_k1_mean:.4f} | **{c5_k1_mean-std_k1_mean:+.4f}** |
-| Z2 collapse shift | — | — | {z2_shift:.4f} |
+| Amplitude | DFT k1 (last layer) | Delta k1 |
+|-----------|---------------------|----------|
+| Standard | {std_k1_final:.4f} | — |
+"""
+    for amp, k1_val, dk1 in k1_scan_rows:
+        tag = " <-- best" if amp == best_ppl_amp else ""
+        report += f"| C5-RPB amp={amp} | {k1_val:.4f} | **{dk1:+.4f}**{tag} |\n"
 
+    report += f"""
 **Interpretation:**
 - k1 measures C5 cyclic structure in head attention patterns (0=none, 1=perfect pentagon)
-- Standard k1 = {std_k1_final:.4f} → {'Near zero: heads are homogenized' if std_k1_final < 0.05 else 'Low: weak natural C5 structure' if std_k1_final < 0.15 else 'Moderate: some natural phase structure'}
-- C5-RPB k1 = {c5_k1_final:.4f} → {'Strong C5 structure injected' if c5_k1_final > 0.2 else 'Moderate C5 structure injected' if c5_k1_final > 0.1 else 'Weak C5 structure'}
-- Z2 shift = {z2_shift:.4f} → {'Significant: Z2 negation is detectable' if z2_shift > 0.05 else 'Weak: Z2 negation barely detectable'}
+- Standard k1 = {std_k1_final:.4f} -> {'Near zero: heads are homogenized' if std_k1_final < 0.05 else 'Low: weak natural C5 structure' if std_k1_final < 0.15 else 'Moderate: some natural phase structure'}
+- Best C5-RPB k1 = {final_c5_k1:.4f} (amp={best_ppl_amp}) -> {'Strong C5 structure injected' if final_c5_k1 > 0.2 else 'Moderate C5 structure' if final_c5_k1 > 0.1 else 'Weak C5 structure'}
 
-## 4. Perplexity Cost
+## 4. Z2 Negation Detection
+
+| Metric | Value |
+|--------|-------|
+| Collapse point | Layer {collapse_layer} |
+| Z2 phase sim shift | **{z2_shift:.4f}** |
+| Test amplitude | {z2_amp} |
+
+**Interpretation:**
+- Z2 shift measures how much the phase structure reshuffles after Z2 negation (flipping phi_shift by pi)
+- Z2 shift = {z2_shift:.4f} -> {'Significant: Z2 negation is clearly detectable' if z2_shift > 0.10 else 'Detectable: Z2 negation has measurable effect' if z2_shift > 0.03 else 'Weak: Z2 negation barely affects phase structure'}
+
+## 5. Perplexity Cost
 
 | Config | PPL | Change |
 |--------|-----|--------|
-| Standard | {std_ppl:.2f} | — |
+| Standard | {std_ppl:.2f} | -- |
 """
     for amp, ppl, pct in ppl_results:
-        tag = " ← recommended" if amp == best_amp else ""
-        report += f"| C5-RPB (amp={amp}) | {ppl:.2f} | {pct:+.1f}%{tag} |\n"
+        tag = " <-- recommended" if amp == best_ppl_amp else ""
+        if pct < 2:
+            cost_label = "FREE LUNCH"
+        elif pct < 5:
+            cost_label = "cheap"
+        elif pct < 10:
+            cost_label = "moderate"
+        else:
+            cost_label = "expensive"
+        report += f"| C5-RPB amp={amp} | {ppl:.2f} | {pct:+.1f}% ({cost_label}){tag} |\n"
+    report += f"| Z2 flip (amp=0.5) | {z2_ppl:.2f} | {z2_pct:+.1f}% |\n"
 
     report += f"""
-## 5. Recommendation
+## 6. Scoring Breakdown
 
-**Recommended amplitude: {best_amp}**
+| Component | Score | Detail |
+|-----------|-------|--------|
+"""
+    for d in score_details:
+        parts = d.split(": ")
+        report += f"| {parts[0]} | {parts[1]} |\n"
+    report += f"| **Total** | **{score}/9** | Grade: **{grade}** |\n"
+
+    report += f"""
+## 7. Recommendation
+
+**Recommended amplitude: {best_ppl_amp}** (PPL cost: {best_ppl_pct:+.1f}%)
 
 """
     if grade == "A":
-        report += "This model is an excellent candidate for C5-RPB integration. The structure injects cleanly with near-zero perplexity cost. Both training-time and inference-time integration are viable.\n"
+        report += "This model is an excellent candidate for C5-RPB integration. The structure injects cleanly with near-zero perplexity cost. Both training-time and inference-time integration are viable.\n\n"
+        report += "**Next steps:**\n"
+        report += "1. Deploy C5-RPB at amp=0.5 in inference pipeline\n"
+        report += "2. Run downstream task benchmarks to confirm quality preservation\n"
+        report += "3. Consider training-time integration for even stronger structure\n"
     elif grade == "B":
-        report += "This model is a good candidate for C5-RPB integration. Structure injects well with modest cost. Training-time integration is recommended for best results; inference-time injection is viable at amp=0.5.\n"
+        report += "This model is a good candidate for C5-RPB integration. Structure injects well with low cost. Inference-time injection is viable at the recommended amplitude.\n\n"
+        report += "**Next steps:**\n"
+        report += f"1. Add C5-RPB at amp={best_ppl_amp} to your model's attention forward pass\n"
+        report += "2. Run downstream task benchmarks\n"
+        report += "3. Training-time integration recommended for best results\n"
     elif grade == "C":
-        report += "This model has moderate C5 compatibility. Structure can be injected but with either weak signal or significant PPL cost. Training-time integration with gradual ramp-up is recommended.\n"
+        report += "This model has moderate C5 compatibility. Structure can be injected but signal or cost needs tuning. Training-time integration with gradual ramp-up is recommended.\n\n"
+        report += "**Next steps:**\n"
+        report += "1. Start with amp=0.5 and validate downstream quality\n"
+        report += "2. If signal is weak, try training-time integration\n"
+        report += "3. Combine with phi-Residual for dual control\n"
     else:
-        report += "This model has low C5 compatibility. Head differentiation may be insufficient, or PPL cost is too high for inference-time injection. Requires training-time integration from scratch.\n"
+        report += "This model has low C5 compatibility. Head differentiation may be insufficient, or PPL cost is too high for inference-time injection. Requires training-time integration from scratch.\n\n"
+        report += "**Next steps:**\n"
+        report += "1. Training-time C5-RPB integration is the only viable path\n"
+        report += "2. Start with amp=0.3 and gradually increase during training\n"
+        report += "3. Monitor k1 and PPL jointly during training\n"
 
     report += f"""
-## 6. Next Steps
+## 8. Combined Options
 
-1. **Inference-time**: Add C5-RPB at amp={best_amp} to your model's attention forward pass
-2. **Training-time**: Integrate C5-RPB into your training code from the start for zero-cost structure
-3. **Combined**: Use phi-Residual (changes "how much") + C5-RPB (changes "where to look") for dual control
+| Approach | What it changes | Cost | Strength |
+|----------|----------------|------|----------|
+| C5-RPB (amp=0.5) | Where heads look | {best_ppl_pct:+.1f}% PPL | C5 phase structure |
+| phi-Residual | How much each layer contributes | ~0% PPL | Homeostatic balance |
+| Both combined | Where + How much | ~{best_ppl_pct:+.1f}% PPL | Full D10 control |
 
 ---
 
-*Report generated by [phi-attention](https://github.com/wangjun112233/phi-attention) diagnostic tool*
+*Report generated by [phi-attention](https://github.com/wangjun112233/phi-attention) diagnostic tool v2*
 *Contact: fdr-factor@coze.email*
 """
 
@@ -532,7 +671,11 @@ C5-RPB assigns heads to 5 phase groups based on head index modulo 5:
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(report)
     print(f"\nReport saved to: {output_path}", flush=True)
-    print(f"\nGrade: {grade} — {grade_desc}", flush=True)
+    print(f"\n{'='*70}", flush=True)
+    print(f"Grade: {grade} (score: {score}/9)", flush=True)
+    print(f"Best amp: {best_ppl_amp} (PPL: {best_ppl_pct:+.1f}%)", flush=True)
+    print(f"Z2 shift: {z2_shift:.4f}", flush=True)
+    print(f"{'='*70}", flush=True)
 
 if __name__ == "__main__":
     main()
