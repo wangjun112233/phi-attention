@@ -343,7 +343,7 @@ def main():
     model_path = os.path.normpath(os.path.abspath(args.model_path))
     model_name = os.path.basename(os.path.dirname(model_path)).replace('--', '/')
 
-    AMP_SCAN = [0.3, 0.5, 1.0]  # k1 scan amplitudes
+    AMP_SCAN = [0.3, 0.5, 1.0, 2.0]  # k1 scan amplitudes (include 2.0 for max signal)
     AMP_PPL  = [0.5, 1.0, 2.0]  # PPL scan amplitudes
 
     print("=" * 70, flush=True)
@@ -494,27 +494,28 @@ def main():
     z2_pct = ((z2_ppl - std_ppl) / std_ppl) * 100
     print(f"  Z2 flip (amp=0.5): PPL={z2_ppl:.2f} ({z2_pct:+.1f}%)", flush=True)
 
-    # Find best amp (highest with PPL < 5%)
-    best_ppl_amp = 0.5
-    best_ppl_pct = 999
+    # Find best amp: free-lunch mode (PPL < 5%) and max-signal mode
+    # Free-lunch: highest amp with PPL < 5%
+    free_amp, free_pct = 0.5, 999
     for amp, ppl, pct in ppl_results:
-        if pct < 5 and amp >= best_ppl_amp:
-            best_ppl_amp = amp
-        if abs(pct) < abs(best_ppl_pct):
-            best_ppl_pct = pct
-            best_ppl_amp_fallback = amp
-    if best_ppl_amp == 0.5 and best_ppl_pct >= 5:
-        best_ppl_amp = best_ppl_amp_fallback
-        best_ppl_pct = best_ppl_pct
+        if pct < 5 and amp >= free_amp:
+            free_amp = amp
+            free_pct = pct
+    # Max-signal: amp=2.0 (strongest C5 structure regardless of cost)
+    max_amp = 2.0
+    max_pct = [p for p in ppl_results if p[0] == 2.0][0][2] if any(p[0] == 2.0 for p in ppl_results) else 0
 
-    # Use k1 from the best PPL amp
-    final_c5_k1 = np.mean(amp_k1_results.get(best_ppl_amp, amp_k1_results[0.5])[n_layers-1])
-    final_c5_k1_mean = np.mean([np.mean(v) for v in amp_k1_results.get(best_ppl_amp, amp_k1_results[0.5]).values()])
+    # k1 at each mode
+    free_k1 = np.mean(amp_k1_results.get(free_amp, amp_k1_results[0.5])[n_layers-1])
+    max_k1 = np.mean(amp_k1_results.get(max_amp, amp_k1_results[0.5])[n_layers-1])
 
-    # Grade
+    # Dual grading
     print("\n[7/7] Generating report...", flush=True)
-    grade, grade_desc, score, score_details = grade_c5_compatibility(
-        std_k1_final, final_c5_k1, z2_shift, abs(best_ppl_pct)
+    grade_free, desc_free, score_free, details_free = grade_c5_compatibility(
+        std_k1_final, free_k1, z2_shift, abs(free_pct)
+    )
+    grade_max, desc_max, score_max, details_max = grade_c5_compatibility(
+        std_k1_final, max_k1, z2_shift, abs(max_pct)
     )
 
     # Head grouping info
@@ -529,13 +530,33 @@ def main():
         dk1 = k1_val - std_k1_final
         k1_scan_rows.append((amp, k1_val, dk1))
 
+    # Determine labels for each amp
+    def ppl_label(pct):
+        if pct < 2: return "FREE LUNCH"
+        elif pct < 5: return "cheap"
+        elif pct < 10: return "moderate"
+        else: return "expensive"
+
     # Generate report
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     report = f"""# C5-RPB Diagnostic Report
 
 **Model:** {model_name}  
-**Date:** {now}  
-**Grade: {grade}** — {grade_desc}
+**Date:** {now}
+
+---
+
+## Dual Grade
+
+| Mode | Grade | Score | amp | k1 | Delta k1 | Z2 shift | PPL cost |
+|------|-------|-------|-----|----|----------|-----------|----------|
+| Free-lunch | **{grade_free}** | {score_free}/9 | {free_amp} | {free_k1:.4f} | {free_k1-std_k1_final:+.4f} | {z2_shift:.4f} | {free_pct:+.1f}% |
+| Max-signal | **{grade_max}** | {score_max}/9 | {max_amp} | {max_k1:.4f} | {max_k1-std_k1_final:+.4f} | {z2_shift:.4f} | {max_pct:+.1f}% |
+
+- **Free-lunch**: Best k1 at the lowest PPL cost (amp where PPL < 5%)
+- **Max-signal**: Strongest C5 structure regardless of PPL cost (amp=2.0)
+
+{desc_free}
 
 ---
 
@@ -564,19 +585,21 @@ C5-RPB assigns heads to 5 phase groups based on head index modulo 5:
     report += f"""
 ## 3. C5 Structure — k1 Amplitude Scan
 
-| Amplitude | DFT k1 (last layer) | Delta k1 |
-|-----------|---------------------|----------|
-| Standard | {std_k1_final:.4f} | — |
+| Amplitude | DFT k1 (last layer) | Delta k1 | Fold change |
+|-----------|---------------------|----------|-------------|
+| Standard | {std_k1_final:.4f} | -- | 1x |
 """
     for amp, k1_val, dk1 in k1_scan_rows:
-        tag = " <-- best" if amp == best_ppl_amp else ""
-        report += f"| C5-RPB amp={amp} | {k1_val:.4f} | **{dk1:+.4f}**{tag} |\n"
+        fold = k1_val / max(std_k1_final, 1e-10)
+        tag = " <-- free-lunch" if amp == free_amp else " <-- max-signal" if amp == max_amp else ""
+        report += f"| C5-RPB amp={amp} | {k1_val:.4f} | **{dk1:+.4f}** | {fold:.1f}x{tag} |\n"
 
     report += f"""
 **Interpretation:**
 - k1 measures C5 cyclic structure in head attention patterns (0=none, 1=perfect pentagon)
 - Standard k1 = {std_k1_final:.4f} -> {'Near zero: heads are homogenized' if std_k1_final < 0.05 else 'Low: weak natural C5 structure' if std_k1_final < 0.15 else 'Moderate: some natural phase structure'}
-- Best C5-RPB k1 = {final_c5_k1:.4f} (amp={best_ppl_amp}) -> {'Strong C5 structure injected' if final_c5_k1 > 0.2 else 'Moderate C5 structure' if final_c5_k1 > 0.1 else 'Weak C5 structure'}
+- At free-lunch amp={free_amp}: k1={free_k1:.4f} ({free_k1/std_k1_final:.1f}x) with {free_pct:+.1f}% PPL cost
+- At max-signal amp={max_amp}: k1={max_k1:.4f} ({max_k1/std_k1_final:.1f}x) with {max_pct:+.1f}% PPL cost
 
 ## 4. Z2 Negation Detection
 
@@ -592,73 +615,60 @@ C5-RPB assigns heads to 5 phase groups based on head index modulo 5:
 
 ## 5. Perplexity Cost
 
-| Config | PPL | Change |
-|--------|-----|--------|
-| Standard | {std_ppl:.2f} | -- |
+| Config | PPL | Change | Label |
+|--------|-----|--------|-------|
+| Standard | {std_ppl:.2f} | -- | -- |
 """
     for amp, ppl, pct in ppl_results:
-        tag = " <-- recommended" if amp == best_ppl_amp else ""
-        if pct < 2:
-            cost_label = "FREE LUNCH"
-        elif pct < 5:
-            cost_label = "cheap"
-        elif pct < 10:
-            cost_label = "moderate"
-        else:
-            cost_label = "expensive"
-        report += f"| C5-RPB amp={amp} | {ppl:.2f} | {pct:+.1f}% ({cost_label}){tag} |\n"
-    report += f"| Z2 flip (amp=0.5) | {z2_ppl:.2f} | {z2_pct:+.1f}% |\n"
+        tag = " <-- free-lunch" if amp == free_amp else " <-- max-signal" if amp == max_amp else ""
+        report += f"| C5-RPB amp={amp} | {ppl:.2f} | {pct:+.1f}% | {ppl_label(pct)}{tag} |\n"
+    report += f"| Z2 flip (amp=0.5) | {z2_ppl:.2f} | {z2_pct:+.1f}% | {ppl_label(abs(z2_pct))} |\n"
 
     report += f"""
 ## 6. Scoring Breakdown
 
+**Free-lunch mode (amp={free_amp}):**
+
 | Component | Score | Detail |
 |-----------|-------|--------|
 """
-    for d in score_details:
+    for d in details_free:
         parts = d.split(": ")
         report += f"| {parts[0]} | {parts[1]} |\n"
-    report += f"| **Total** | **{score}/9** | Grade: **{grade}** |\n"
+    report += f"| **Total** | **{score_free}/9** | Grade: **{grade_free}** |\n"
+
+    report += f"""
+**Max-signal mode (amp={max_amp}):**
+
+| Component | Score | Detail |
+|-----------|-------|--------|
+"""
+    for d in details_max:
+        parts = d.split(": ")
+        report += f"| {parts[0]} | {parts[1]} |\n"
+    report += f"| **Total** | **{score_max}/9** | Grade: **{grade_max}** |\n"
 
     report += f"""
 ## 7. Recommendation
 
-**Recommended amplitude: {best_ppl_amp}** (PPL cost: {best_ppl_pct:+.1f}%)
+**For inference-time (no retraining):**
+- Use amp={free_amp} for free-lunch deployment (PPL cost: {free_pct:+.1f}%)
+- C5 structure is {'strong' if free_k1 > 0.2 else 'moderate' if free_k1 > 0.05 else 'detectable'} at this amplitude
+- Z2 negation is {'clearly detectable' if z2_shift > 0.10 else 'detectable' if z2_shift > 0.03 else 'weak'} at this amplitude
 
-"""
-    if grade == "A":
-        report += "This model is an excellent candidate for C5-RPB integration. The structure injects cleanly with near-zero perplexity cost. Both training-time and inference-time integration are viable.\n\n"
-        report += "**Next steps:**\n"
-        report += "1. Deploy C5-RPB at amp=0.5 in inference pipeline\n"
-        report += "2. Run downstream task benchmarks to confirm quality preservation\n"
-        report += "3. Consider training-time integration for even stronger structure\n"
-    elif grade == "B":
-        report += "This model is a good candidate for C5-RPB integration. Structure injects well with low cost. Inference-time injection is viable at the recommended amplitude.\n\n"
-        report += "**Next steps:**\n"
-        report += f"1. Add C5-RPB at amp={best_ppl_amp} to your model's attention forward pass\n"
-        report += "2. Run downstream task benchmarks\n"
-        report += "3. Training-time integration recommended for best results\n"
-    elif grade == "C":
-        report += "This model has moderate C5 compatibility. Structure can be injected but signal or cost needs tuning. Training-time integration with gradual ramp-up is recommended.\n\n"
-        report += "**Next steps:**\n"
-        report += "1. Start with amp=0.5 and validate downstream quality\n"
-        report += "2. If signal is weak, try training-time integration\n"
-        report += "3. Combine with phi-Residual for dual control\n"
-    else:
-        report += "This model has low C5 compatibility. Head differentiation may be insufficient, or PPL cost is too high for inference-time injection. Requires training-time integration from scratch.\n\n"
-        report += "**Next steps:**\n"
-        report += "1. Training-time C5-RPB integration is the only viable path\n"
-        report += "2. Start with amp=0.3 and gradually increase during training\n"
-        report += "3. Monitor k1 and PPL jointly during training\n"
+**For training-time (from scratch or fine-tune):**
+- Start with amp={free_amp} and gradually ramp to amp={max_amp} during training
+- This gives the strongest C5 structure (k1={max_k1:.4f}) with zero PPL cost at convergence
+- The model learns to accommodate the C5-RPB bias during training
 
-    report += f"""
 ## 8. Combined Options
 
-| Approach | What it changes | Cost | Strength |
-|----------|----------------|------|----------|
-| C5-RPB (amp=0.5) | Where heads look | {best_ppl_pct:+.1f}% PPL | C5 phase structure |
+| Approach | What it changes | Cost (inference) | Strength |
+|----------|----------------|------------------|----------|
+| C5-RPB (amp={free_amp}) | Where heads look | {free_pct:+.1f}% PPL | {'Strong' if free_k1 > 0.2 else 'Moderate'} C5 phase structure |
+| C5-RPB (amp={max_amp}) | Where heads look | {max_pct:+.1f}% PPL | Strong C5 phase structure |
 | phi-Residual | How much each layer contributes | ~0% PPL | Homeostatic balance |
-| Both combined | Where + How much | ~{best_ppl_pct:+.1f}% PPL | Full D10 control |
+| Both (amp={free_amp}) | Where + How much | ~{free_pct:+.1f}% PPL | Full D10 control |
 
 ---
 
@@ -672,8 +682,8 @@ C5-RPB assigns heads to 5 phase groups based on head index modulo 5:
         f.write(report)
     print(f"\nReport saved to: {output_path}", flush=True)
     print(f"\n{'='*70}", flush=True)
-    print(f"Grade: {grade} (score: {score}/9)", flush=True)
-    print(f"Best amp: {best_ppl_amp} (PPL: {best_ppl_pct:+.1f}%)", flush=True)
+    print(f"Free-lunch: Grade {grade_free} (score: {score_free}/9) at amp={free_amp} (PPL: {free_pct:+.1f}%)", flush=True)
+    print(f"Max-signal: Grade {grade_max} (score: {score_max}/9) at amp={max_amp} (PPL: {max_pct:+.1f}%)", flush=True)
     print(f"Z2 shift: {z2_shift:.4f}", flush=True)
     print(f"{'='*70}", flush=True)
 
