@@ -348,13 +348,14 @@ def main():
     
     # ===== 加载模型 =====
     print("\n[1] 加载模型...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, use_fast=True, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=torch.float32,
         device_map=args.device,
         trust_remote_code=True,
         attn_implementation="eager",  # 强制eager以获取attention weights
+        local_files_only=True,
     )
     model.eval()
     
