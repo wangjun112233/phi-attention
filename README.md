@@ -1,14 +1,100 @@
-# φ-Attention: The Golden Coupling for Multi-Head Attention
+# C5-RPB: Diagnose & Inject C5 Phase Structure into LLMs
 
-**Spectral gap 20× higher than standard attention. Zero hyperparameters. Only the coupling matrix changes.**
+**5 minutes to diagnose your LLM's C5 phase compatibility, 0.6% cost to inject a detectable attention topology.**
 
 ---
 
-## The Recipe (丹方)
+## What It Does
+
+- **Diagnose** — Measure head differentiation and C5 compatibility (k1 metric) in any transformer model
+- **Inject** — C5-RPB bias makes heads exhibit 5-phase cyclic structure
+- **Verify** — Z₂ flip is detectable (collapse shift), PPL cost < 1%
+
+---
+
+## Quick Start
+
+```bash
+# Step 1: Diagnose
+python five_motion_arch/c5_rpb_qwen_verify_v4.py --model_path YOUR_MODEL --device cpu
+
+# Step 2: Check PPL cost
+python five_motion_arch/c5_rpb_perplexity_test.py --model_path YOUR_MODEL --device cpu
+```
+
+---
+
+## Results
+
+### Qwen2.5-1.5B
+
+| Metric | Standard | C5-RPB (amp=0.5) | Delta |
+|--------|----------|-------------------|-------|
+| DFT k1 | 0.017 | 0.313 | +0.296 |
+| PPL | 5.67 | 5.70 | +0.6% |
+| Z₂ collapse shift | — | — | 0.184 |
+
+### Qwen2.5-3B
+
+| Metric | Standard | C5-RPB (amp=0.5) | Delta |
+|--------|----------|-------------------|-------|
+| DFT k1 | 0.026 | 0.267 | +0.241 |
+| Z₂ collapse shift | — | — | 0.158 |
+
+---
+
+## How It Works
+
+**C5-RPB** = Relative Position Bias with C5-cycle phase encoding
+
+```
+B[h,i,j] = A·cos(2π(h%5)/5 + φ_shift + π(i-j)/L)
+```
+
+- `h%5` → C5 rotation (phase group)
+- `i-j` → relative position
+- `φ_shift` → Z₂ negation
+
+**Why attention, not residual?** Attention is a live carrier for C5 structure. Residual connections wash out topology — they mix everything uniformly. Attention bias preserves phase differentiation because each head selects *where to look* independently.
+
+---
+
+## Full Validation Chain
+
+8 experiments, from concept to working solution:
+
+| Experiment | Result | Key Finding |
+|------------|--------|-------------|
+| φ-Residual (v15–v18) | ✅ PASS | Changes "how much" (α scaling works) |
+| Attribution Patching | ❌ FAIL | C5 ≠ spatial parcels |
+| Phase Structure | ❌ FAIL | C5 ≠ layer rotation |
+| φ-Residual + LoRA | ❌ FAIL | LoRA absorbs variance |
+| Superposition (vector α) | ❌ FAIL | Residual washes C5 |
+| C5-Q Coupling (numpy) | ❌ FAIL | Random projection drowns signal |
+| C5-RPB (numpy) | ⚠️ WEAK | Z₂ grows but k1 ≈ 0 |
+| C5-RPB (1.5B real) | ✅✅✅ PASS | k1=0.31, Z₂=0.184, PPL+0.6% |
+
+**Takeaway:** 6 out of 8 approaches failed. The only path that works injects C5 structure into attention bias (not residual, not Q/K projection). The signal must go where heads make decisions.
+
+---
+
+## Two Orthogonal Knobs
+
+| Knob | Controls | Mechanism |
+|------|----------|-----------|
+| **φ-Residual** | "how much" (α scaling) | Scales residual connection amplitude |
+| **C5-RPB** | "where to look" (phase bias) | Phase-biased relative position encoding |
+
+These are independent — you can use either or both.
+
+---
+
+<details>
+<summary><strong>Technical Details (Background)</strong></summary>
+
+## The φ-Attention Recipe (丹方)
 
 φ-Attention is a coupled multi-head attention mechanism derived from the C5-cycle structure. The coupling weight `cos(72°)` is the **unique** value that makes the 5-cycle adjacency matrix's largest eigenvalue equal to `φ = 1.618...` (the golden ratio). This is not a hyperparameter — it's an algebraic necessity.
-
-The mechanism works like a recipe with five steps, each verified by code simulation:
 
 ### ① Furnace (炉子) — The Structure
 
@@ -42,7 +128,7 @@ Each head talks only to its two neighbors. The coupling topology is a 5-cycle. N
 | IB: I(Z;Y) at convergence | **0.9991** | — | 0 |
 
 - Signal propagates to neighbors in 1 step, reaches uniform distribution by step 22
-- PF eigenvector is perfectly uniform → symmetric equal-weight分工
+- PF eigenvector is perfectly uniform → symmetric equal-weight 分工
 - C5 mixes 2.3× faster than C8 (shorter diameter)
 - Information Bottleneck: C5 preserves more task-relevant information at the same compression rate
 
@@ -81,9 +167,7 @@ Better long-range consistency (ret@2048: 0.622 > 0.606)
 
 Every step is a direct algebraic consequence of the C5 structure. The chain does not depend on weights, inputs, or training — it follows from `λ_k = 1 + 2·cos72°·cos(2πk/5)`.
 
----
-
-## Quick Summary
+### Summary Table
 
 | Claim | Evidence | Type |
 |-------|----------|------|
@@ -94,36 +178,7 @@ Every step is a direct algebraic consequence of the C5 structure. The chain does
 | 13% JSD improvement | 0.451 vs 0.521 | Empirical |
 | Causal chain 7/7 | All steps verified | Mixed |
 
----
-
-## Usage
-
-```python
-from phi_attention_module import PhiAttention
-
-# Drop-in replacement for nn.MultiheadAttention
-attn = PhiAttention(d_model=640, n_heads=5, coupling_weight=0.309)
-output = attn(query, key, value)
-```
-
-## Repository Structure
-
-```
-phi_attention/
-├── phi_attention_module.py          # Core module
-├── phi_attention_report.md          # Toy experiment report
-├── phi_vs_l2_experiment.py          # φ vs L2 comparison
-├── phi_vs_l2_report.md              # L2 fails to reproduce C5 effect
-├── phi_c5_dynamics.py               # Step ③: heat control simulation
-├── phi_c5_dynamics_report.md        # Mixing time, PF, IB analysis
-├── phi_pharmacology.py              # Step ⑤: causal chain verification
-├── phi_pharmacology_report.md       # 7/7 chain closed
-├── phi_longrange_100seed.py         # 100-seed long-range experiment
-├── phi_longrange_100seed_report.md  # Statistical analysis
-└── README.md                        # This file
-```
-
-## Relation to Existing Work
+### Relation to Existing Work
 
 | Method | Approach | φ-Attention difference |
 |--------|----------|----------------------|
@@ -133,14 +188,58 @@ phi_attention/
 | Grouped Query Attention | Reduce KV heads | φ-Attention keeps all heads, adds coupling |
 | Multi-Head Attention | Independent parallel heads | φ-Attention makes heads interdependent via C5 topology |
 
-**Complementary, not competing.** φ-Attention can be combined with sparse/linear/cross-layer methods — it addresses a different bottleneck: the *spectral gap* of the head interaction graph.
+**Complementary, not competing.** C5-RPB can be combined with sparse/linear/cross-layer methods — it addresses a different bottleneck: the *phase structure* of the head interaction graph.
+
+</details>
+
+---
+
+## Repository Structure
+
+```
+phi-attention/
+├── README.md                                    # This file
+├── phi_attention_module.py                      # Core φ-Attention module
+├── phi_attention.py                             # Standalone experiment script
+├── phi_attention_colab.py                       # Colab-compatible version
+├── phi_attention_numpy.py                       # NumPy-only implementation
+├── phi_attention_termux.py                      # Termux-compatible version
+├── phi_attention_report.md                      # Toy experiment report
+├── phi_c5_dynamics_report.md                    # Mixing time, PF, IB analysis
+├── phi_pharmacology.py                          # Causal chain verification
+├── phi_pharmacology_report.md                   # 7/7 chain closed
+├── phi_longrange_100seed.py                     # 100-seed long-range experiment
+├── phi_longrange_100seed_report.md              # Statistical analysis
+├── phi_vs_l2_experiment.py                      # φ vs L2 comparison
+├── phi_vs_l2_report.md                          # L2 fails to reproduce C5 effect
+├── five_motion_arch/                            # C5-RPB diagnostic & injection tools
+│   ├── c5_rpb_qwen_verify_v4.py                 # ★ C5-RPB diagnostic (head-level h%5)
+│   ├── c5_rpb_perplexity_test.py                # ★ PPL cost measurement
+│   ├── PHI_RESIDUAL_VALIDATION.md               # Full validation report (v15–v19)
+│   ├── c5_rpb_qwen_verify.py                    # C5-RPB verify (v1)
+│   ├── c5_rpb_qwen_verify_v2.py                 # C5-RPB verify (v2)
+│   ├── c5_rpb_qwen_verify_v3.py                 # C5-RPB verify (v3)
+│   ├── c5_rpb_attention_verify.py               # NumPy C5-RPB verification
+│   ├── c5_attention_numpy_verify.py             # NumPy attention verification
+│   ├── c5_attention_sweep.py                    # Parameter sweep
+│   ├── d10_patch_qwen_v15.py                    # φ-Residual (v15, passing)
+│   ├── d10_patch_qwen_v16.py                    # φ-Residual (v16)
+│   ├── d10_patch_qwen_v17.py                    # φ-Residual (v17)
+│   ├── five_motion_attribution.py               # Attribution patching experiment
+│   ├── five_motion_phase.py                     # Phase structure experiment
+│   ├── phi_finetune_experiment.py               # LoRA finetune experiment
+│   └── ...                                     # Earlier versions (v2–v14)
+└── five_motion_bridge/                          # Bridge deployment scripts
+    ├── five_motion_bridge.py
+    └── deploy_bridge.sh
+```
+
+---
 
 ## License
 
 MIT
 
 ## Contact
-
-Working on attention mechanism design? Interested in scaling this to production models? 
 
 - **Email:** fdr-factor@coze.email
