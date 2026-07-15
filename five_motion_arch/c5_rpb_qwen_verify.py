@@ -13,6 +13,9 @@ C5-RPB Attention — 真实Qwen2.5-1.5B验证
 兼容: transformers 5.13.1, Qwen2.5-1.5B/3B
 """
 
+import os
+os.environ["HF_HUB_OFFLINE"] = "1"  # 强制离线，防止transformers把本地路径当repo ID验证
+
 import argparse
 import math
 import torch
@@ -339,18 +342,24 @@ def main():
                         help='生成token数')
     args = parser.parse_args()
     
+    # 归一化本地路径
+    model_path = os.path.normpath(os.path.abspath(args.model_path))
+    if not os.path.isdir(model_path):
+        print(f"错误: 模型路径不存在: {model_path}")
+        return
+    
     print("=" * 70)
     print("C5-RPB Attention — 真实Qwen2.5验证")
     print("=" * 70)
-    print(f"\n模型: {args.model_path}")
+    print(f"\n模型: {model_path}")
     print(f"RPB幅度: {args.rpb_amp}")
     print(f"设备: {args.device}")
     
     # ===== 加载模型 =====
     print("\n[1] 加载模型...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True, use_fast=True, local_files_only=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True, use_fast=True, local_files_only=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        model_path,
         torch_dtype=torch.float32,
         device_map=args.device,
         trust_remote_code=True,
@@ -703,13 +712,4 @@ def main():
     # Z₂判定
     if collapse_layer in c5_c5 and collapse_layer + 1 in c5_c5:
         shift = np.mean(np.abs(c5_c5[collapse_layer+1]['sim_matrix'] - z2_c5[collapse_layer+1]['sim_matrix']))
-        print(f"\n  Z₂塌缩偏移(层{collapse_layer+1}): {shift:.4f}")
-        if shift > 0.1:
-            print("  ✅✅ Z₂否定在训练模型上产生显著塌缩!")
-        elif shift > 0.03:
-            print("  ⚠️ Z₂否定有可观测偏移")
-        else:
-            print("  ❌ Z₂否定偏移仍然太小")
-
-if __name__ == "__main__":
-    main()
+   
