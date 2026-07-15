@@ -283,7 +283,7 @@ def main():
     print(f"  Layers: {n_layers}, Heads: {n_heads}, KV Heads: {n_kv_heads}", flush=True)
     print(f"  Hidden: {hidden_size}, Head dim: {head_dim}", flush=True)
 
-    # ===== Prepare inputs =====
+    # ===== Prepare inputs (pad to same length) =====
     print("\n[2] Preparing 5 motion inputs...", flush=True)
     encoded = {}
     for motion, prompt in PROMPTS.items():
@@ -291,8 +291,19 @@ def main():
         encoded[motion] = inputs
         print(f"  {motion}: {prompt[:50]}... (seq_len={inputs['input_ids'].shape[1]})", flush=True)
 
+    # Pad all to same length
     max_seq = max(v['input_ids'].shape[1] for v in encoded.values())
     print(f"  Max seq length: {max_seq}", flush=True)
+    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+    for motion in encoded:
+        cur_len = encoded[motion]['input_ids'].shape[1]
+        if cur_len < max_seq:
+            pad_len = max_seq - cur_len
+            encoded[motion]['input_ids'] = torch.cat(
+                [encoded[motion]['input_ids'], torch.full((1, pad_len), pad_id, device=args.device)], dim=1)
+            encoded[motion]['attention_mask'] = torch.cat(
+                [encoded[motion]['attention_mask'], torch.zeros((1, pad_len), device=args.device, dtype=torch.long)], dim=1)
+    print(f"  All inputs padded to seq_len={max_seq}", flush=True)
 
     # ===== Experiment 1: Standard Attention =====
     print("\n[3] Standard Attention (no RPB)...", flush=True)
