@@ -243,3 +243,31 @@ MIT
 ## Contact
 
 - **Email:** fdr-factor@coze.email
+
+---
+
+## Paper: The Dihedral Group D₁₀ as a Generator of Fundamental Constants
+
+**18 constants from one structure, zero structural parameters.**
+
+📄 **[D10_paper.tex](paper/D10_paper.tex)** — Full LaTeX source (902 lines, 18 Theorems)
+📄 **[D10_paper.md](paper/D10_paper.md)** — Markdown version
+📄 **[D10_paper_v5c.docx](paper/D10_paper_v5c.docx)** — Word version
+
+### Key Results
+- CKM 4 Wolfenstein parameters from D₁₀ with zero structural parameters (6/9 elements <1% PDG 2022)
+- Complete D₁₀-invariant Yukawa + flavon Lagrangian (Schur's lemma → GJ texture)
+- CKM approximate RG invariance under MSSM 1-loop running
+- Feigenbaum constants from D₁₀ dynamics (δ_F to 2×10⁻⁶ precision)
+- 6 live seams = signature of incompleteness = activity
+
+### Verification (pure NumPy, zero dependencies)
+```bash
+python verification/d10_transcription_factor.py   # GJ texture + Born factorization + CKM
+python verification/d10_flavon_construction.py     # CG decomposition + flavon potential
+python verification/d10_flavon_minimization.py     # VEV minimization + cross-term
+python verification/d10_ckm_rg_running_v3.py       # MSSM 1-loop RG + correction budget
+```
+
+### Author
+**戬羽** (Jianyu)
